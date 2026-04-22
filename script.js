@@ -21,33 +21,95 @@ getAnalytics(app);
 const db = getFirestore(app);
 
 // ─────────────────────────────────────────────
+//  HORÁRIO DE CORTE
+//  Altere este valor para mudar o horário em que
+//  o sistema passa a agendar para o próximo dia.
+// ─────────────────────────────────────────────
+const HORA_CORTE = 17;
+
+// ─────────────────────────────────────────────
 //  DATAS
+//  Todas as funções usam o fuso horário de
+//  Brasília (America/Sao_Paulo) explicitamente,
+//  evitando erros quando o navegador ou servidor
+//  estiver em UTC ou outro fuso.
 // ─────────────────────────────────────────────
 
-function obterDataHoje() {
-    const d = new Date();
-    const ano = d.getFullYear();
-    const mes = String(d.getMonth() + 1).padStart(2, "0");
-    const dia = String(d.getDate()).padStart(2, "0");
-    return `${ano}-${mes}-${dia}`;
+/**
+ * Retorna um objeto Date ajustado para Brasília.
+ * Usa Intl.DateTimeFormat para extrair os campos
+ * corretamente independente do fuso do dispositivo.
+ */
+function agoraBrasilia() {
+    const agora = new Date();
+    const partes = new Intl.DateTimeFormat("pt-BR", {
+        timeZone: "America/Sao_Paulo",
+        year:     "numeric",
+        month:    "2-digit",
+        day:      "2-digit",
+        hour:     "2-digit",
+        minute:   "2-digit",
+        hour12:   false
+    }).formatToParts(agora);
+
+    const get = (tipo) => parseInt(partes.find(p => p.type === tipo).value, 10);
+
+    return {
+        ano:    get("year"),
+        mes:    get("month"),
+        dia:    get("day"),
+        hora:   get("hour"),
+        minuto: get("minute")
+    };
 }
 
-function obterProximoDiaUtil() {
-    const agora = new Date();
-    const d = new Date(agora);
+/**
+ * Retorna true se o horário em Brasília já passou do corte.
+ */
+function aposHoraCorte() {
+    return agoraBrasilia().hora >= HORA_CORTE;
+}
 
-    if (agora.getHours() >= 17) {
+/**
+ * Retorna a data de hoje em YYYY-MM-DD no fuso de Brasília.
+ */
+function obterDataHoje() {
+    const { ano, mes, dia } = agoraBrasilia();
+    return `${ano}-${String(mes).padStart(2,"0")}-${String(dia).padStart(2,"0")}`;
+}
+
+/**
+ * Retorna a "data de referência" do sistema:
+ * - Antes das 17h (Brasília) → hoje
+ * - A partir das 17h (Brasília) → próximo dia útil
+ *
+ * Esta é a data usada em TUDO: exibição, filtragem e agendamento.
+ */
+function obterDataReferencia() {
+    const { ano, mes, dia, hora } = agoraBrasilia();
+
+    // Monta um Date local com os valores de Brasília
+    const d = new Date(ano, mes - 1, dia);
+
+    if (hora >= HORA_CORTE) {
         d.setDate(d.getDate() + 1);
     }
 
+    // Pula fins de semana
     while (d.getDay() === 0 || d.getDay() === 6) {
         d.setDate(d.getDate() + 1);
     }
 
-    const ano = d.getFullYear();
-    const mes = String(d.getMonth() + 1).padStart(2, "0");
-    const dia = String(d.getDate()).padStart(2, "0");
-    return `${ano}-${mes}-${dia}`;
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+
+/**
+ * Data de 7 dias atrás, para delimitar o histórico.
+ */
+function obterDataLimiteHistorico() {
+    const d = new Date();
+    d.setDate(d.getDate() - 7);
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
 }
 
 function formatarDataExibicao(dataStr) {
@@ -56,57 +118,104 @@ function formatarDataExibicao(dataStr) {
 }
 
 // ─────────────────────────────────────────────
-//  LIMPEZA — baseada no Firestore, sem localStorage
+//  LIMPEZA + HISTÓRICO
 //
-//  Lógica:
-//  1. Lê o doc "config/ultimaLimpeza" para saber
-//     quando foi a última limpeza.
-//  2. Se já limpou hoje, não faz nada.
-//  3. Se não limpou hoje, apaga todos os agendamentos
-//     cuja data < hoje e atualiza o doc de controle.
-//
-//  Assim a limpeza acontece uma vez por dia,
-//  na primeira abertura do site — independente
-//  de quem acessa ou que horas é.
+//  Regra simples:
+//  - A limpeza só roda se o horário for >= 17h.
+//  - A chave de controle é apenas a data do dia.
+//  - Se já limpou hoje (após 17h), não faz nada.
+//  - Antes de apagar, copia tudo para "historico".
+//  - Histórico é mantido por 7 dias.
 // ─────────────────────────────────────────────
 
-async function limparAgendamentosAntigos() {
+async function salvarNoHistorico(agendamentos) {
+    if (agendamentos.length === 0) return;
     try {
-        const hoje = obterDataHoje();
+        const promessas = agendamentos.map(a =>
+            addDoc(collection(db, "historico"), {
+                professor:   a.professor,
+                projetor:    a.projetor,
+                horario:     a.horario,
+                data:        a.data,
+                arquivadoEm: obterDataHoje()
+            })
+        );
+        await Promise.all(promessas);
+        console.log(`[Histórico] ${agendamentos.length} registro(s) salvos.`);
+    } catch (err) {
+        console.error("[Histórico] Erro ao salvar:", err);
+    }
+}
+
+async function limparHistoricoAntigo() {
+    try {
+        const limite = obterDataLimiteHistorico();
+        const snap = await getDocs(collection(db, "historico"));
+        const antigas = [];
+        snap.forEach(docSnap => {
+            const arquivado = docSnap.data().arquivadoEm;
+            if (arquivado && arquivado < limite) {
+                antigas.push(deleteDoc(doc(db, "historico", docSnap.id)));
+            }
+        });
+        if (antigas.length > 0) {
+            await Promise.all(antigas);
+            console.log(`[Histórico] ${antigas.length} registro(s) antigo(s) removidos.`);
+        }
+    } catch (err) {
+        console.error("[Histórico] Erro ao limpar antigos:", err);
+    }
+}
+
+async function limparAgendamentos() {
+    try {
+        // Só executa após a hora de corte
+        if (!aposHoraCorte()) {
+            console.log("[Limpeza] Ainda não é hora de limpar.");
+            return;
+        }
+
+        const hoje      = obterDataHoje();
         const configRef = doc(db, "config", "ultimaLimpeza");
         const configSnap = await getDoc(configRef);
-
         const ultimaLimpeza = configSnap.exists()
             ? configSnap.data().dataLimpeza
             : null;
 
-        // Já limpou hoje, não precisa fazer nada
+        // Já limpou hoje após as 17h
         if (ultimaLimpeza === hoje) {
             console.log("[Limpeza] Já realizada hoje:", hoje);
             return;
         }
 
-        // Busca e apaga agendamentos antigos
-        const querySnapshot = await getDocs(collection(db, "agendamentos"));
-        const promessas = [];
-        querySnapshot.forEach((docSnap) => {
-            const data = docSnap.data().data;
-            if (data && data < hoje) {
-                promessas.push(deleteDoc(doc(db, "agendamentos", docSnap.id)));
+        // Busca todos os agendamentos cujo dia já encerrou (data <= hoje)
+        const snap = await getDocs(collection(db, "agendamentos"));
+        const paraApagar = [];
+        const dadosParaHistorico = [];
+
+        snap.forEach(docSnap => {
+            const dados   = docSnap.data();
+            const dataDoc = dados.data;
+            if (dataDoc <= hoje) {
+                dadosParaHistorico.push(dados);
+                paraApagar.push(deleteDoc(doc(db, "agendamentos", docSnap.id)));
             }
         });
 
-        if (promessas.length > 0) {
-            await Promise.all(promessas);
-            console.log(`[Limpeza] ${promessas.length} agendamento(s) antigo(s) removido(s).`);
+        if (paraApagar.length > 0) {
+            await salvarNoHistorico(dadosParaHistorico);
+            await Promise.all(paraApagar);
+            console.log(`[Limpeza] ${paraApagar.length} agendamento(s) removidos.`);
         }
 
-        // Registra a data da limpeza no Firestore
+        // Limpa histórico com mais de 7 dias
+        await limparHistoricoAntigo();
+
+        // Registra que a limpeza do dia foi feita
         await setDoc(configRef, { dataLimpeza: hoje });
-        console.log("[Limpeza] Registro atualizado para:", hoje);
+        console.log("[Limpeza] Concluída para:", hoje);
 
     } catch (err) {
-        // Erro na limpeza não deve impedir o resto do sistema
         console.error("[Limpeza] Erro (não crítico):", err);
     }
 }
@@ -116,48 +225,49 @@ async function limparAgendamentosAntigos() {
 // ─────────────────────────────────────────────
 
 async function carregarAgendamentos() {
-    const querySnapshot = await getDocs(collection(db, "agendamentos"));
-    const agendamentos = [];
-    querySnapshot.forEach((docSnap) => {
-        agendamentos.push({ id: docSnap.id, ...docSnap.data() });
-    });
-    return agendamentos;
+    const snap = await getDocs(collection(db, "agendamentos"));
+    const lista = [];
+    snap.forEach(docSnap => lista.push({ id: docSnap.id, ...docSnap.data() }));
+    return lista;
+}
+
+async function carregarHistorico() {
+    const snap = await getDocs(collection(db, "historico"));
+    const lista = [];
+    snap.forEach(docSnap => lista.push({ id: docSnap.id, ...docSnap.data() }));
+    return lista;
 }
 
 // ─────────────────────────────────────────────
-//  HORÁRIOS
+//  HORÁRIOS DISPONÍVEIS
 // ─────────────────────────────────────────────
 
 async function atualizarHorariosDisponiveis() {
-    const projetorSelect = document.getElementById("projetor");
+    const projetorSelect    = document.getElementById("projetor");
     const horariosContainer = document.getElementById("horarios-container");
     if (!projetorSelect || !horariosContainer) return;
 
-    // Mostra feedback de carregamento
     horariosContainer.innerHTML =
         '<span style="font-size:13px;color:var(--text-muted)">Carregando horários...</span>';
 
-    const horarios = ["1º", "2º", "3º", "4º", "5º", "Alm.", "6º", "7º", "8º", "9º"];
+    const horarios = ["1º","2º","3º","4º","5º","Alm.","6º","7º","8º","9º"];
     const projetorSelecionado = projetorSelect.value;
-    const dataFormatada = obterProximoDiaUtil();
+    const dataRef = obterDataReferencia(); // usa a data de referência correta
 
     let horariosOcupados = [];
     try {
         const agendamentos = await carregarAgendamentos();
         horariosOcupados = agendamentos
-            .filter(a => a.projetor === projetorSelecionado && a.data === dataFormatada)
+            .filter(a => a.projetor === projetorSelecionado && a.data === dataRef)
             .map(a => a.horario);
     } catch (err) {
-        console.error("[Horários] Erro ao carregar do Firebase:", err);
-        // Continua e mostra todos como disponíveis
+        console.error("[Horários] Erro:", err);
     }
 
     horariosContainer.innerHTML = "";
-
     horarios.forEach(horario => {
         const label    = document.createElement("label");
         const checkbox = document.createElement("input");
-
         checkbox.type  = "checkbox";
         checkbox.value = horario;
         checkbox.name  = "horario";
@@ -168,7 +278,6 @@ async function atualizarHorariosDisponiveis() {
         } else {
             label.classList.add("horario-disponivel");
         }
-
         label.appendChild(checkbox);
         label.appendChild(document.createTextNode(" " + horario));
         horariosContainer.appendChild(label);
@@ -189,33 +298,30 @@ async function atualizarListaAgendamentos() {
     if (!tbody) return;
     tbody.innerHTML = "";
 
-    const hoje = obterDataHoje();
-    if (dataEl) dataEl.textContent = formatarDataExibicao(hoje);
+    // Exibe a data de referência (não necessariamente hoje)
+    const dataRef = obterDataReferencia();
+    if (dataEl) dataEl.textContent = formatarDataExibicao(dataRef);
 
     let agendamentos = [];
     try {
         agendamentos = await carregarAgendamentos();
     } catch (err) {
-        console.error("[Tabela] Erro ao carregar:", err);
+        console.error("[Tabela] Erro:", err);
     }
 
-    const agendamentosAtivos = agendamentos.filter(a => a.data >= hoje);
+    // Mostra apenas os agendamentos da data de referência
+    const ativos = agendamentos.filter(a => a.data === dataRef);
 
-    // Agrupa por professor+equipamento (junta horários da mesma combinação)
+    // Agrupa por professor + equipamento
     const agrupados = {};
-    agendamentosAtivos.forEach(a => {
+    ativos.forEach(a => {
         const chave = `${a.professor}__${a.projetor}`;
         if (!agrupados[chave]) {
-            agrupados[chave] = {
-                professor: a.professor,
-                projetor: a.projetor,
-                horarios: []
-            };
+            agrupados[chave] = { professor: a.professor, projetor: a.projetor, horarios: [] };
         }
         agrupados[chave].horarios.push(a.horario);
     });
 
-    // Ordena por professor para ficarem agrupados visualmente
     const lista = Object.values(agrupados).sort((a, b) =>
         a.professor.localeCompare(b.professor)
     );
@@ -225,7 +331,6 @@ async function atualizarListaAgendamentos() {
     let ultimoProfessor = null;
     lista.forEach(a => {
         const tr = document.createElement("tr");
-        // Destaca visualmente quando muda de professor
         if (a.professor !== ultimoProfessor) {
             tr.classList.add("tr-novo-professor");
             ultimoProfessor = a.professor;
@@ -244,17 +349,16 @@ async function atualizarListaAgendamentos() {
 // ─────────────────────────────────────────────
 
 function confirmarAcao(mensagem, callback) {
-    const overlay  = document.getElementById("modal-overlay");
-    const msgEl    = document.getElementById("modal-msg");
-    const btnSim   = document.getElementById("modal-confirmar");
-    const btnNao   = document.getElementById("modal-cancelar");
+    const overlay = document.getElementById("modal-overlay");
+    const msgEl   = document.getElementById("modal-msg");
+    const btnSim  = document.getElementById("modal-confirmar");
+    const btnNao  = document.getElementById("modal-cancelar");
     if (!overlay) return;
 
     msgEl.textContent = mensagem;
     overlay.style.display = "flex";
 
     const fechar = () => { overlay.style.display = "none"; };
-
     btnSim.onclick = () => { fechar(); callback(); };
     btnNao.onclick = fechar;
     overlay.onclick = (e) => { if (e.target === overlay) fechar(); };
@@ -273,7 +377,7 @@ async function carregarGerenciar() {
 
     painel.innerHTML = '<p style="color:var(--text-muted);font-size:14px;text-align:center;padding:20px">Carregando...</p>';
 
-    const hoje = obterDataHoje();
+    const dataRef = obterDataReferencia();
     let agendamentos = [];
     try {
         agendamentos = await carregarAgendamentos();
@@ -281,7 +385,8 @@ async function carregarGerenciar() {
         console.error("[Gerenciar] Erro:", err);
     }
 
-    const ativos = agendamentos.filter(a => a.data >= hoje);
+    // Mostra os agendamentos da data de referência
+    const ativos = agendamentos.filter(a => a.data === dataRef);
     painel.innerHTML = "";
 
     if (ativos.length === 0) {
@@ -297,18 +402,15 @@ async function carregarGerenciar() {
         porProfessor[a.professor].push(a);
     });
 
-    // Ordena professores alfabeticamente
     const professores = Object.keys(porProfessor).sort((a, b) => a.localeCompare(b));
 
     professores.forEach(professor => {
         const registros = porProfessor[professor];
         const ids = registros.map(r => r.id);
 
-        // Card do professor
         const card = document.createElement("div");
         card.className = "gerenciar-card";
 
-        // Cabeçalho do professor
         const header = document.createElement("div");
         header.className = "gerenciar-card-header";
         header.innerHTML = `
@@ -317,20 +419,16 @@ async function carregarGerenciar() {
                 <span class="gerenciar-professor-nome">${professor}</span>
                 <span class="gerenciar-badge">${ids.length} horário${ids.length > 1 ? "s" : ""}</span>
             </div>
-            <button class="btn-excluir-todos" data-professor="${professor}">
-                Excluir todos
-            </button>
+            <button class="btn-excluir-todos" data-professor="${professor}">Excluir todos</button>
         `;
         card.appendChild(header);
 
-        // Agrupa por equipamento dentro do professor
         const porEquipamento = {};
         registros.forEach(r => {
             if (!porEquipamento[r.projetor]) porEquipamento[r.projetor] = [];
             porEquipamento[r.projetor].push(r);
         });
 
-        // Lista de equipamentos e horários
         const lista = document.createElement("div");
         lista.className = "gerenciar-lista";
 
@@ -364,18 +462,16 @@ async function carregarGerenciar() {
         painel.appendChild(card);
     });
 
-    // Eventos — excluir horário individual
+    // Eventos
     painel.querySelectorAll(".btn-excluir-chip").forEach(btn => {
         btn.addEventListener("click", () => {
-            const id = btn.dataset.id;
             confirmarAcao("Excluir este horário?", async () => {
-                await excluirPorIds([id]);
+                await excluirPorIds([btn.dataset.id]);
                 await carregarGerenciar();
             });
         });
     });
 
-    // Eventos — excluir todos do professor
     painel.querySelectorAll(".btn-excluir-todos").forEach(btn => {
         btn.addEventListener("click", () => {
             const professor = btn.dataset.professor;
@@ -388,6 +484,99 @@ async function carregarGerenciar() {
                 }
             );
         });
+    });
+}
+
+// ─────────────────────────────────────────────
+//  HISTÓRICO SEMANAL (historico.html)
+// ─────────────────────────────────────────────
+
+async function carregarPaginaHistorico() {
+    const painel  = document.getElementById("painel-historico");
+    const vazioEl = document.getElementById("historico-vazio");
+    if (!painel) return;
+
+    painel.innerHTML = '<p style="color:var(--text-muted);font-size:14px;text-align:center;padding:20px">Carregando histórico...</p>';
+
+    let historico = [];
+    try {
+        historico = await carregarHistorico();
+    } catch (err) {
+        console.error("[Histórico] Erro:", err);
+    }
+
+    painel.innerHTML = "";
+
+    if (historico.length === 0) {
+        if (vazioEl) vazioEl.style.display = "block";
+        return;
+    }
+    if (vazioEl) vazioEl.style.display = "none";
+
+    // Agrupa por data (mais recente primeiro)
+    const porData = {};
+    historico.forEach(a => {
+        if (!porData[a.data]) porData[a.data] = [];
+        porData[a.data].push(a);
+    });
+
+    const datas = Object.keys(porData).sort((a, b) => b.localeCompare(a));
+
+    datas.forEach(data => {
+        const registros = porData[data];
+
+        // Título da data
+        const tituloDiv = document.createElement("div");
+        tituloDiv.className = "historico-data-titulo";
+        tituloDiv.textContent = formatarDataExibicao(data);
+        painel.appendChild(tituloDiv);
+
+        // Tabela da data
+        const card = document.createElement("div");
+        card.className = "card table-card";
+        card.style.marginBottom = "16px";
+
+        const tableScroll = document.createElement("div");
+        tableScroll.className = "table-scroll";
+
+        const table = document.createElement("table");
+        table.innerHTML = `
+            <thead>
+                <tr>
+                    <th>Professor</th>
+                    <th>Equipamento</th>
+                    <th>Horários</th>
+                </tr>
+            </thead>
+        `;
+        const tbody = document.createElement("tbody");
+
+        // Agrupa por professor+equipamento dentro da data
+        const agrupados = {};
+        registros.forEach(a => {
+            const chave = `${a.professor}__${a.projetor}`;
+            if (!agrupados[chave]) {
+                agrupados[chave] = { professor: a.professor, projetor: a.projetor, horarios: [] };
+            }
+            agrupados[chave].horarios.push(a.horario);
+        });
+
+        Object.values(agrupados)
+            .sort((a, b) => a.professor.localeCompare(b.professor))
+            .forEach(a => {
+                const tr = document.createElement("tr");
+                tr.innerHTML = `
+                    <td>${a.professor}</td>
+                    <td>${a.projetor}</td>
+                    <td>${a.horarios.sort().join(", ")}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+        table.appendChild(tbody);
+        tableScroll.appendChild(table);
+        card.appendChild(tableScroll);
+        painel.appendChild(card);
     });
 }
 
@@ -407,22 +596,17 @@ function mostrarToast(mensagem, tipo = "success") {
 //  INICIALIZAÇÃO
 // ─────────────────────────────────────────────
 
-// Usa 'load' ao invés de 'DOMContentLoaded' para garantir
-// que os módulos do Firebase já foram completamente inicializados
 window.addEventListener("load", async () => {
 
     // Limpeza em background — não bloqueia a interface
-    limparAgendamentosAntigos();
+    limparAgendamentos();
 
     const form           = document.getElementById("agendamento-form");
     const projetorSelect = document.getElementById("projetor");
 
-    // Página index.html
+    // ── index.html
     if (form && projetorSelect) {
-
-        // Carrega horários imediatamente
         await atualizarHorariosDisponiveis();
-
         projetorSelect.addEventListener("change", atualizarHorariosDisponiveis);
 
         form.addEventListener("submit", async (e) => {
@@ -433,7 +617,7 @@ window.addEventListener("load", async () => {
             const horariosSelecionados = Array.from(
                 document.querySelectorAll("input[name='horario']:checked")
             ).map(cb => cb.value);
-            const dataFormatada = obterProximoDiaUtil();
+            const dataRef = obterDataReferencia();
 
             if (!professor || !projetor || horariosSelecionados.length === 0) {
                 mostrarToast("Preencha todos os campos e selecione ao menos um horário.", "error");
@@ -449,13 +633,10 @@ window.addEventListener("load", async () => {
             try {
                 for (const horario of horariosSelecionados) {
                     await addDoc(collection(db, "agendamentos"), {
-                        professor,
-                        projetor,
-                        horario,
-                        data: dataFormatada
+                        professor, projetor, horario, data: dataRef
                     });
                 }
-                mostrarToast(`Agendamento confirmado para ${formatarDataExibicao(dataFormatada)}! ✓`);
+                mostrarToast(`Agendamento confirmado para ${formatarDataExibicao(dataRef)}! ✓`);
                 form.reset();
                 await atualizarHorariosDisponiveis();
             } catch (err) {
@@ -470,9 +651,12 @@ window.addEventListener("load", async () => {
         });
     }
 
-    // Página agendamentos.html
+    // ── agendamentos.html
     await atualizarListaAgendamentos();
 
-    // Página gerenciar.html
+    // ── gerenciar.html
     await carregarGerenciar();
+
+    // ── historico.html
+    await carregarPaginaHistorico();
 });
