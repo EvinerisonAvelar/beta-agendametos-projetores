@@ -176,7 +176,9 @@ async function limparAgendamentos() {
 
         snap.forEach(docSnap => {
             const dados = docSnap.data();
-            if (dados.data && dados.data <= hoje) {
+            const deveApagar = dados.data && dados.data <= hoje;
+            console.log(`[Limpeza] Documento: data=${dados.data} | hoje=${hoje} | deveApagar=${deveApagar} | professor=${dados.professor}`);
+            if (deveApagar) {
                 dadosParaHistorico.push(dados);
                 idsParaApagar.push(docSnap.id);
             }
@@ -594,8 +596,10 @@ function mostrarToast(mensagem, tipo = "success") {
 
 window.addEventListener("load", async () => {
 
-    // Limpeza em background — não bloqueia a interface
-    limparAgendamentos();
+    // Aguarda a limpeza terminar antes de qualquer outra operação.
+    // Isso evita que um agendamento feito logo após o carregamento
+    // seja apagado por uma limpeza ainda em andamento em paralelo.
+    await limparAgendamentos();
 
     const form           = document.getElementById("agendamento-form");
     const projetorSelect = document.getElementById("projetor");
