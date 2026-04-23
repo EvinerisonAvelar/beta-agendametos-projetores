@@ -128,25 +128,6 @@ function formatarDataExibicao(dataStr) {
 //  - Histórico é mantido por 7 dias.
 // ─────────────────────────────────────────────
 
-async function salvarNoHistorico(agendamentos) {
-    if (agendamentos.length === 0) return;
-    try {
-        const promessas = agendamentos.map(a =>
-            addDoc(collection(db, "historico"), {
-                professor:   a.professor,
-                projetor:    a.projetor,
-                horario:     a.horario,
-                data:        a.data,
-                arquivadoEm: obterDataHoje()
-            })
-        );
-        await Promise.all(promessas);
-        console.log(`[Histórico] ${agendamentos.length} registro(s) salvos.`);
-    } catch (err) {
-        console.error("[Histórico] Erro ao salvar:", err);
-    }
-}
-
 async function limparHistoricoAntigo() {
     try {
         const limite = obterDataLimiteHistorico();
@@ -175,8 +156,8 @@ async function limparAgendamentos() {
             return;
         }
 
-        const hoje      = obterDataHoje();
-        const configRef = doc(db, "config", "ultimaLimpeza");
+        const hoje       = obterDataHoje();
+        const configRef  = doc(db, "config", "ultimaLimpeza");
         const configSnap = await getDoc(configRef);
         const ultimaLimpeza = configSnap.exists()
             ? configSnap.data().dataLimpeza
@@ -188,35 +169,50 @@ async function limparAgendamentos() {
             return;
         }
 
-        // Busca todos os agendamentos cujo dia já encerrou (data <= hoje)
+        // Busca agendamentos cujo dia já encerrou (data <= hoje)
         const snap = await getDocs(collection(db, "agendamentos"));
-        const paraApagar = [];
         const dadosParaHistorico = [];
+        const idsParaApagar = [];
 
         snap.forEach(docSnap => {
-            const dados   = docSnap.data();
-            const dataDoc = dados.data;
-            if (dataDoc <= hoje) {
+            const dados = docSnap.data();
+            if (dados.data && dados.data <= hoje) {
                 dadosParaHistorico.push(dados);
-                paraApagar.push(deleteDoc(doc(db, "agendamentos", docSnap.id)));
+                idsParaApagar.push(docSnap.id);
             }
         });
 
-        if (paraApagar.length > 0) {
-            await salvarNoHistorico(dadosParaHistorico);
-            await Promise.all(paraApagar);
-            console.log(`[Limpeza] ${paraApagar.length} agendamento(s) removidos.`);
+        console.log(`[Limpeza] ${idsParaApagar.length} agendamento(s) encontrados para remover.`);
+
+        if (idsParaApagar.length > 0) {
+            // 1. Salva no histórico — um por um para garantir que cada documento é criado
+            for (const dados of dadosParaHistorico) {
+                await addDoc(collection(db, "historico"), {
+                    professor:   dados.professor,
+                    projetor:    dados.projetor,
+                    horario:     dados.horario,
+                    data:        dados.data,
+                    arquivadoEm: hoje
+                });
+            }
+            console.log(`[Histórico] ${dadosParaHistorico.length} registro(s) salvos.`);
+
+            // 2. Só apaga depois que o histórico foi salvo com sucesso
+            for (const id of idsParaApagar) {
+                await deleteDoc(doc(db, "agendamentos", id));
+            }
+            console.log(`[Limpeza] ${idsParaApagar.length} agendamento(s) removidos.`);
         }
 
-        // Limpa histórico com mais de 7 dias
+        // 3. Limpa histórico com mais de 7 dias
         await limparHistoricoAntigo();
 
-        // Registra que a limpeza do dia foi feita
+        // 4. Registra que a limpeza foi feita — só aqui, após tudo ter sido executado
         await setDoc(configRef, { dataLimpeza: hoje });
         console.log("[Limpeza] Concluída para:", hoje);
 
     } catch (err) {
-        console.error("[Limpeza] Erro (não crítico):", err);
+        console.error("[Limpeza] Erro:", err);
     }
 }
 
